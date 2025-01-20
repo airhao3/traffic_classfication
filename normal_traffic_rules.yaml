@@ -1,0 +1,32 @@
+---
+# 已知的正常流量规则
+
+# IP地址规则
+known_ips:
+  # 内部服务器IP
+  - ip: "192.168.1.100"
+    description: "内部Web服务器"
+  - ip: "192.168.1.101"
+    description: "内部数据库服务器"
+
+# 端口规则
+known_ports:
+  - port: 80
+    description: "HTTP流量"
+  - port: 443
+    description: "HTTPS流量"
+  - port: 53
+    description: "DNS流量"
+
+# 流量模式规则
+traffic_patterns:
+  # 定义正常的流量范围
+  max_bytes_per_min: 1000000  # 每分钟最大字节数
+  max_packets_per_min: 1000   # 每分钟最大包数
+  max_connections_per_min: 100 # 每分钟最大连接数
+
+# 时间规则
+time_patterns:
+  - start_time: "09:00"
+    end_time: "18:00"
+    description: "工作时间"

@@ -1,0 +1,60 @@
+# 流量检测配置文件
+
+# 数据源配置
+# 可选值: 'arkime' 或 'pcap'
+data_source: 'pcap'
+
+# Arkime配置
+arkime:
+  elasticsearch_host: 'http://cvatserver.me:9200'
+  index: 'sessions3-*'  # Arkime的会话索引模式
+  time_window_hours: 1  # 历史数据分析窗口
+
+# PCAP配置
+pcap:
+  # 训练数据配置
+  training:
+    normal_traffic_dir: './normal_traffic'    # 正常流量数据目录
+    abnormal_traffic_dir: './abnormal_traffic'  # 异常流量数据目录
+    normal_traffic_pattern: '*.pcap'    # 正常流量文件匹配模式
+    abnormal_traffic_pattern: '*.pcap'  # 异常流量文件匹配模式
+  
+  # 实时检测配置
+  detection:
+    interface: 'en0'  # 实时捕获的网络接口
+    pcap_file: null  # 如果设置，则从指定的pcap文件读取而不是实时捕获
+    capture_filter: 'tcp'  # 数据包捕获过滤器
+
+# 分析配置
+analysis:
+  interval_seconds: 300  # 分析间隔（秒）
+  batch_size: 10000     # 每批处理的最大会话数
+  alert_threshold: 0.8  # 异常分数阈值
+
+# 特征提取配置
+feature_extraction:
+  time_window: 60  # 时间窗口大小(秒)
+  min_packets: 10  # 最小包数阈值
+  features:
+    - duration
+    - bytes_sent
+    - bytes_received
+    - packets_sent
+    - packets_received
+    - avg_packet_size
+    - bytes_per_second
+    - packets_per_second
+
+# 模型配置
+model:
+  contamination: 0.1  # 异常比例
+  random_state: 42    # 随机种子
+  n_estimators: 100   # 决策树数量
+
+# 告警配置
+alert:
+  log_file: 'alerts.log'  # 告警日志文件
+  severity_levels:        # 告警级别定义
+    high: 0.9
+    medium: 0.7
+    low: 0.5

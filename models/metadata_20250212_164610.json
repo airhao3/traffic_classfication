@@ -1,0 +1,67 @@
+{
+  "version": "20250212_164610",
+  "created_at": "2025-02-12T16:49:18.822917",
+  "config": {
+    "data_source": "pcap",
+    "arkime": {
+      "elasticsearch_host": "http://cvatserver.me:9200",
+      "index": "sessions3-*",
+      "time_window_hours": 1
+    },
+    "pcap": {
+      "training": {
+        "normal_traffic_dir": "./normal_traffic",
+        "abnormal_traffic_dir": "./abnormal_traffic",
+        "normal_traffic_pattern": "*.pcap",
+        "abnormal_traffic_pattern": "*.pcap"
+      },
+      "detection": {
+        "interface": "en0",
+        "pcap_file": null,
+        "capture_filter": "tcp"
+      }
+    },
+    "analysis": {
+      "interval_seconds": 300,
+      "batch_size": 10000,
+      "alert_threshold": 0.8
+    },
+    "feature_extraction": {
+      "time_window": 60,
+      "min_packets": 10,
+      "features": [
+        "duration",
+        "bytes_sent",
+        "bytes_received",
+        "packets_sent",
+        "packets_received",
+        "avg_packet_size",
+        "bytes_per_second",
+        "packets_per_second"
+      ]
+    },
+    "model": {
+      "contamination": 0.1,
+      "random_state": 42,
+      "n_estimators": 100
+    },
+    "alert": {
+      "log_file": "alerts.log",
+      "severity_levels": {
+        "high": 0.9,
+        "medium": 0.7,
+        "low": 0.5
+      }
+    }
+  },
+  "features": [
+    "duration",
+    "bytes_sent",
+    "bytes_received",
+    "packets_sent",
+    "packets_received",
+    "avg_packet_size",
+    "bytes_per_second",
+    "packets_per_second"
+  ]
+}

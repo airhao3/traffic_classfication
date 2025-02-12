@@ -8,6 +8,19 @@ known_ips:
     description: "内部Web服务器"
   - ip: "192.168.1.101"
     description: "内部数据库服务器"
+  # 内部网络
+  - ip: "172.19.102.28"
+    description: "内部客户端"
+  
+  # Cloudflare IPs
+  - ip: "104.18.4.46"
+    description: "Cloudflare Edge Server"
+  - ip: "104.18.5.46"
+    description: "Cloudflare Edge Server"
+  
+  # AWS IPs
+  - ip: "18.138.68.29"
+    description: "AWS Server"
 
 # 端口规则
 known_ports:
@@ -15,18 +28,63 @@ known_ports:
     description: "HTTP流量"
   - port: 443
     description: "HTTPS流量"
+  - port: 2083
+    description: "加密Web面板访问"
   - port: 53
     description: "DNS流量"
+  - port: 8443
+    description: "备用HTTPS端口"
 
-# 流量模式规则
+# 已知的正常连接模式
+known_connections:
+  - src_ip: "172.19.102.28"
+    dst_ip: "104.18.4.46"
+    dst_port: 2083
+    description: "Web面板访问"
+  - src_ip: "172.19.102.28"
+    dst_ip: "104.18.5.46"
+    dst_port: 2083
+    description: "Web面板访问"
+  - src_ip: "172.19.102.28"
+    dst_ip: "18.138.68.29"
+    dst_port: 443
+    description: "AWS HTTPS访问"
+
+# 流量特征规则
 traffic_patterns:
-  # 定义正常的流量范围
+  # 基本流量限制
   max_bytes_per_min: 1000000  # 每分钟最大字节数
   max_packets_per_min: 1000   # 每分钟最大包数
   max_connections_per_min: 100 # 每分钟最大连接数
+  
+  # 正常连接特征
+  normal_connection_patterns:
+    - pattern_name: "HTTPS流量"
+      min_duration: 1         # 最小持续时间（秒）
+      max_duration: 3600      # 最大持续时间（秒）
+      min_bytes: 100         # 最小字节数
+      max_bytes: 10000000    # 最大字节数
+      ports: [443, 8443]
+    
+    - pattern_name: "Web面板访问"
+      min_duration: 1
+      max_duration: 1800
+      min_bytes: 100
+      max_bytes: 5000000
+      ports: [2083]
 
 # 时间规则
 time_patterns:
   - start_time: "09:00"
     end_time: "18:00"
     description: "工作时间"
+  - start_time: "00:00"
+    end_time: "23:59"
+    description: "24小时服务"
+    services: ["HTTPS", "DNS"]
+
+# 异常评分阈值
+scoring_thresholds:
+  min_anomaly_score: -0.4  # 低于此分数视为异常
+  max_normal_connections_per_ip: 50  # 每个IP的最大正常连接数
+  max_concurrent_connections: 20     # 最大并发连接数

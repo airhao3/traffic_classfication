@@ -18,6 +18,7 @@ import yaml
 import os
 import json
 import glob
+from visualization import TrafficVisualizer
 
 # 确保logs目录存在
 os.makedirs('logs', exist_ok=True)
@@ -665,12 +666,40 @@ if __name__ == "__main__":
                 # 预处理数据
                 df = preprocess_tcp_features(df)
                 
+                # 创建可视化器
+                visualizer = TrafficVisualizer()
+                
+                # 特征可视化
+                logger.info('正在生成特征可视化图表...')
+                visualizer.plot_feature_distributions(df)
+                visualizer.plot_correlation_matrix(df)
+                visualizer.plot_scatter_matrix(df)
+                
+                # 添加聚类分析
+                logger.info('正在进行流量聚类分析...')
+                clusters = visualizer.plot_clusters(df, n_clusters=3)
+                
+                # 将聚类结果添加到数据框中
+                df['cluster'] = clusters
+                
+                if 'timestamp' in df.columns:
+                    time_features = ['bytes_per_second', 'packets_per_second']
+                    visualizer.plot_time_series(df, 'timestamp', time_features)
+                
                 # 训练并评估模型
                 train_and_evaluate_model(df)
                 
+                # 特征重要性可视化
+                if hasattr(analyzer.model, 'feature_importances_'):
+                    feature_names = analyzer.get_feature_names()
+                    visualizer.plot_feature_importance(
+                        feature_names,
+                        analyzer.model.feature_importances_
+                    )
+                
                 # 保存模型
                 analyzer.save_model()
-                logger.info('模型训练和保存完成')
+                logger.info('模型训练、可视化和保存完成')
                 
         elif args.mode == 'detect':
             # 确保模型已加载

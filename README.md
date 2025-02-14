@@ -13,7 +13,12 @@
 - 使用隔离森林(Isolation Forest)进行异常检测
 - 支持模型的保存和加载
 - 详细的日志记录和分析报告
-- 可视化分析结果
+- 高级可视化分析功能：
+  - 交互式可视化（支持缩放、悬停提示等）
+  - 2D和3D降维可视化（t-SNE和PCA）
+  - 异常分数分布分析
+  - 聚类分析和特征重要性可视化
+  - 支持静态（PNG）和交互式（HTML）输出
 
 ## 系统要求
 
@@ -27,6 +32,7 @@
 ```
 ./
 ├── cap.py              # 主程序文件
+├── visualization.py    # 可视化模块
 ├── config.yaml         # 配置文件
 ├── requirements.txt    # 依赖包列表
 ├── normal_traffic/     # 正常流量PCAP文件目录
@@ -34,6 +40,9 @@
 ├── models/            # 保存训练好的模型
 │   ├── model.pkl     # 异常检测模型
 │   └── scaler.pkl    # 特征标准化器
+├── visualizations/    # 可视化输出目录
+│   ├── static/       # 静态图表（PNG格式）
+│   └── interactive/  # 交互式图表（HTML格式）
 └── logs/             # 日志文件目录
 ```
 
@@ -51,7 +60,7 @@ pip install -r requirements.txt
 ```
 4. 创建必要的目录结构：
 ```bash
-mkdir -p normal_traffic abnormal_traffic models logs
+mkdir -p normal_traffic abnormal_traffic models logs visualizations/{static,interactive}
 ```
 
 ## 配置说明
@@ -89,6 +98,55 @@ analysis:
   interval_seconds: 300    # 分析间隔时间
   batch_size: 10000       # 每批处理的最大会话数
   alert_threshold: 0.8    # 异常检测阈值（0-1）
+
+## 可视化功能
+
+系统提供了丰富的可视化功能，帮助分析网络流量特征和异常检测结果：
+
+### 1. 降维可视化
+```python
+from visualization import TrafficVisualizer
+
+# 创建可视化器（支持交互式和静态模式）
+visualizer = TrafficVisualizer(interactive=True)
+
+# 生成2D或3D的降维可视化
+visualizer.plot_dimensionality_reduction(
+    df,                # 数据框
+    method='tsne',     # 'tsne' 或 'pca'
+    n_components=2,    # 2 或 3
+    label_col='label'  # 可选的标签列
+)
+```
+
+### 2. 异常分数分析
+```python
+# 可视化异常分数分布
+visualizer.plot_anomaly_scores(
+    scores,           # 异常分数数组
+    threshold=0.5     # 可选的阈值线
+)
+```
+
+### 3. 聚类分析
+```python
+# 综合聚类分析可视化
+visualizer.plot_cluster_analysis(
+    df,               # 数据框
+    clusters,         # 聚类标签
+    features          # 用于聚类的特征列表
+)
+```
+
+### 4. 特征分析
+- 特征分布可视化
+- 特征相关性矩阵
+- 特征重要性排序
+- 时间序列特征分析
+
+所有可视化结果都会自动保存在 `visualizations` 目录下：
+- 静态图表保存为PNG格式
+- 交互式图表保存为HTML格式，可在浏览器中查看和交互
 
 feature_extraction:
   time_window: 60         # 特征提取时间窗口（秒）

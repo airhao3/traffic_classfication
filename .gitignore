@@ -2,3 +2,9 @@
 input.pcap
 output.csv
 input_traffic.ipynb
+visualizations/
+normal_traffic/
+abnormal_traffic/
+models/
+logs/
+

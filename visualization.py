@@ -4,34 +4,82 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import os
+import logging
+from datetime import datetime
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class TrafficVisualizer:
-    def __init__(self, save_dir='visualizations'):
-        """初始化可视化器
+    def __init__(self, save_dir='visualizations', interactive=True):
+        """Initialize the visualizer
         
         Args:
-            save_dir (str): 保存可视化图表的目录
+            save_dir (str): Directory to save visualization plots
+            interactive (bool): Whether to use interactive Plotly plots
         """
         self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
+        self.interactive = interactive
         
-        # 设置图表样式
-        plt.style.use('seaborn')
-        sns.set_palette("husl")
+        # Create directories for both static and interactive visualizations
+        self.static_dir = os.path.join(save_dir, 'static')
+        self.interactive_dir = os.path.join(save_dir, 'interactive')
+        os.makedirs(self.static_dir, exist_ok=True)
+        os.makedirs(self.interactive_dir, exist_ok=True)
         
-    def save_plot(self, name):
+        # Set plot style
+        if not interactive:
+            plt.style.use('seaborn')
+            sns.set_palette("husl")
+        
+        # Initialize scalers
+        self.standard_scaler = StandardScaler()
+        self.minmax_scaler = MinMaxScaler()
+        
+    def save_plot(self, name, fig=None, interactive=None):
         """保存图表
         
         Args:
             name (str): 图表名称
+            fig: 图表对象 (plt.Figure 或 plotly.Figure)
+            interactive (bool): 是否为交互式图表，如果为None则使用类的默认设置
         """
-        plt.tight_layout()
-        save_path = os.path.join(self.save_dir, f"{name}.png")
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
+        if fig is None:
+            logger.debug(f"No figure provided for {name}, skipping save")
+            return
+            
+        if interactive is None:
+            interactive = self.interactive
+            
+        try:
+            if interactive:
+                if not isinstance(fig, go.Figure):
+                    logger.warning(f"Expected plotly.Figure for interactive plot, got {type(fig)}")
+                    return
+                save_path = os.path.join(self.interactive_dir, f"{name}.html")
+                fig.write_html(save_path)
+                logger.debug(f"Saved interactive plot to {save_path}")
+            else:
+                save_path = os.path.join(self.static_dir, f"{name}.png")
+                if isinstance(fig, plt.Figure):
+                    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+                else:
+                    plt.figure()
+                    plt.tight_layout()
+                    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.debug(f"Saved static plot to {save_path}")
+        except Exception as e:
+            logger.error(f"Error saving plot {name}: {str(e)}")
         
     def plot_feature_distributions(self, df, label_col='label'):
         """绘制特征分布图
@@ -199,31 +247,444 @@ class TrafficVisualizer:
         plt.ylabel(f'主成分2 (解释方差: {pca.explained_variance_ratio_[1]:.2%})')
         plt.legend()
         
-        self.save_plot('traffic_clusters')
+    def plot_dimensionality_reduction(self, df, method='tsne', label_col=None, perplexity=30, n_components=2):
+        """Visualize data distribution using dimensionality reduction
         
-        # 分析每个聚类的特征
+        Args:
+            df (pd.DataFrame): Input DataFrame
+            method (str): Reduction method, 'tsne' or 'pca'
+            label_col (str): Label column for color coding
+            perplexity (int): t-SNE perplexity parameter
+            n_components (int): Number of components (2 or 3)
+        """
+        try:
+            # Select numeric features and remove low variance ones
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            numeric_cols = [col for col in numeric_cols if 
+                           not col.startswith('src_ip_') and 
+                           not col.startswith('dst_ip_') and
+                           col not in ['start_time', 'end_time'] and
+                           (label_col is None or col != label_col)]
+            
+            # Calculate feature variances
+            variances = df[numeric_cols].var()
+            selected_features = variances[variances > 1e-10].index.tolist()
+            
+            if len(selected_features) == 0:
+                logger.warning("No valid numeric features found for dimensionality reduction")
+                return
+            
+            # Prepare data
+            X = df[selected_features].copy()
+            X_scaled = self.standard_scaler.fit_transform(X)
+            
+            # Dimensionality reduction
+            if method.lower() == 'tsne':
+                reducer = TSNE(
+                    n_components=n_components,
+                    perplexity=min(perplexity, len(X) - 1),
+                    random_state=42,
+                    n_iter=1000,
+                    init='pca'
+                )
+                X_reduced = reducer.fit_transform(X_scaled)
+                explained_var = None
+            else:  # PCA
+                reducer = PCA(n_components=n_components)
+                X_reduced = reducer.fit_transform(X_scaled)
+                explained_var = reducer.explained_variance_ratio_
+            
+            if self.interactive:
+                return self._plot_interactive_reduction(X_reduced, df, label_col, method, explained_var, n_components)
+            else:
+                return self._plot_static_reduction(X_reduced, df, label_col, method, explained_var, n_components)
+                
+        except Exception as e:
+            logger.error(f"Error in dimensionality reduction: {str(e)}")
+            raise
+        
+    def _plot_interactive_reduction(self, X_reduced, df, label_col, method, explained_var, n_components):
+        """Create interactive plot using Plotly
+        
+        Args:
+            X_reduced (np.array): Reduced dimensionality data
+            df (pd.DataFrame): Original dataframe
+            label_col (str): Column name for labels
+            method (str): Reduction method used
+            explained_var (np.array): Explained variance ratios for PCA
+            n_components (int): Number of components
+        """
+        if n_components == 2:
+            fig = go.Figure()
+            
+            if label_col is not None and label_col in df.columns:
+                for label in sorted(df[label_col].unique()):
+                    mask = df[label_col] == label
+                    fig.add_trace(go.Scatter(
+                        x=X_reduced[mask, 0],
+                        y=X_reduced[mask, 1],
+                        mode='markers',
+                        name=f'Class {label}',
+                        marker=dict(size=8, opacity=0.7)
+                    ))
+            else:
+                fig.add_trace(go.Scatter(
+                    x=X_reduced[:, 0],
+                    y=X_reduced[:, 1],
+                    mode='markers',
+                    marker=dict(size=8, opacity=0.7)
+                ))
+            
+            title = f'{method.upper()} Visualization'
+            if method == 'pca' and explained_var is not None:
+                title += f'\nExplained variance: {explained_var[0]:.2%}, {explained_var[1]:.2%}'
+            
+            fig.update_layout(
+                title=title,
+                xaxis_title='First Component',
+                yaxis_title='Second Component',
+                template='plotly_white',
+                showlegend=True
+            )
+            
+        else:  # 3D plot
+            if label_col is not None and label_col in df.columns:
+                fig = px.scatter_3d(
+                    x=X_reduced[:, 0],
+                    y=X_reduced[:, 1],
+                    z=X_reduced[:, 2],
+                    color=df[label_col],
+                    opacity=0.7
+                )
+            else:
+                fig = px.scatter_3d(
+                    x=X_reduced[:, 0],
+                    y=X_reduced[:, 1],
+                    z=X_reduced[:, 2],
+                    opacity=0.7
+                )
+            
+            title = f'3D {method.upper()} Visualization'
+            if method == 'pca' and explained_var is not None:
+                title += f'\nExplained variance: {explained_var[0]:.2%}, {explained_var[1]:.2%}, {explained_var[2]:.2%}'
+            
+            fig.update_layout(
+                title=title,
+                scene=dict(
+                    xaxis_title='First Component',
+                    yaxis_title='Second Component',
+                    zaxis_title='Third Component'
+                ),
+                template='plotly_white'
+            )
+        
+        # Save interactive plot
+        self.save_plot(f'{method}_visualization', fig, interactive=True)
+        
+        return fig
+    
+    def _plot_static_reduction(self, X_reduced, df, label_col, method, explained_var, n_components):
+        """Create static plot using Matplotlib
+        
+        Args:
+            X_reduced (np.array): Reduced dimensionality data
+            df (pd.DataFrame): Original dataframe
+            label_col (str): Column name for labels
+            method (str): Reduction method used
+            explained_var (np.array): Explained variance ratios for PCA
+            n_components (int): Number of components
+        """
+        if n_components == 2:
+            fig = plt.figure(figsize=(12, 8))
+            
+            if label_col is not None and label_col in df.columns:
+                unique_labels = sorted(df[label_col].unique())
+                colors = plt.cm.viridis(np.linspace(0, 1, len(unique_labels)))
+                
+                for label, color in zip(unique_labels, colors):
+                    mask = df[label_col] == label
+                    plt.scatter(X_reduced[mask, 0], X_reduced[mask, 1],
+                               c=[color], label=f'Class {label}',
+                               alpha=0.7)
+                plt.legend()
+            else:
+                plt.scatter(X_reduced[:, 0], X_reduced[:, 1],
+                           alpha=0.7, c='blue')
+            
+            title = f'{method.upper()} Visualization'
+            if method == 'pca' and explained_var is not None:
+                title += f'\nExplained variance: {explained_var[0]:.2%}, {explained_var[1]:.2%}'
+            
+            plt.title(title)
+            plt.xlabel('First Component')
+            plt.ylabel('Second Component')
+            plt.grid(True, linestyle='--', alpha=0.3)
+            
+            # Save 2D static plot
+            self.save_plot(f'{method}_visualization_2d', fig, interactive=False)
+            
+        else:  # 3D plot
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            if label_col is not None and label_col in df.columns:
+                unique_labels = sorted(df[label_col].unique())
+                colors = plt.cm.viridis(np.linspace(0, 1, len(unique_labels)))
+                
+                for label, color in zip(unique_labels, colors):
+                    mask = df[label_col] == label
+                    ax.scatter(X_reduced[mask, 0],
+                              X_reduced[mask, 1],
+                              X_reduced[mask, 2],
+                              c=[color],
+                              label=f'Class {label}',
+                              alpha=0.7)
+                ax.legend()
+            else:
+                ax.scatter(X_reduced[:, 0],
+                          X_reduced[:, 1],
+                          X_reduced[:, 2],
+                          alpha=0.7,
+                          c='blue')
+            
+            title = f'3D {method.upper()} Visualization'
+            if method == 'pca' and explained_var is not None:
+                title += f'\nExplained variance: {explained_var[0]:.2%}, {explained_var[1]:.2%}, {explained_var[2]:.2%}'
+            
+            ax.set_title(title)
+            ax.set_xlabel('First Component')
+            ax.set_ylabel('Second Component')
+            ax.set_zlabel('Third Component')
+            
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.save_plot(f'{method}_visualization_{timestamp}')
+        
+    def plot_anomaly_scores(self, scores, threshold=None, interactive=None):
+        """Visualize anomaly scores distribution
+        
+        Args:
+            scores (np.array): Array of anomaly scores
+            threshold (float): Optional threshold for anomaly detection
+            interactive (bool): Whether to use interactive plot (overrides class setting)
+        """
+        interactive = self.interactive if interactive is None else interactive
+        
+        if interactive:
+            fig = go.Figure()
+            
+            # Add histogram of scores
+            fig.add_trace(go.Histogram(
+                x=scores,
+                name='Score Distribution',
+                nbinsx=50,
+                opacity=0.7
+            ))
+            
+            # Add threshold line if provided
+            if threshold is not None:
+                fig.add_vline(
+                    x=threshold,
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text="Anomaly Threshold",
+                    annotation_position="top right"
+                )
+            
+            fig.update_layout(
+                title='Anomaly Score Distribution',
+                xaxis_title='Anomaly Score',
+                yaxis_title='Count',
+                template='plotly_white',
+                showlegend=True
+            )
+            
+            # Save interactive plot
+            self.save_plot('anomaly_scores', fig, interactive=True)
+            
+            return fig
+            
+        else:
+            fig = plt.figure(figsize=(12, 6))
+            plt.hist(scores, bins=50, alpha=0.7, color='blue')
+            
+            # Save static plot
+            self.save_plot('anomaly_scores', fig, interactive=False)
+            
+            if threshold is not None:
+                plt.axvline(x=threshold, color='red', linestyle='--',
+                           label='Anomaly Threshold')
+                plt.legend()
+            
+            plt.title('Anomaly Score Distribution')
+            plt.xlabel('Anomaly Score')
+            plt.ylabel('Count')
+            plt.grid(True, linestyle='--', alpha=0.3)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.save_plot(f'anomaly_scores_{timestamp}')
+    def plot_cluster_analysis(self, df, clusters, features, interactive=None):
+        """Visualize cluster analysis results
+        
+        Args:
+            df (pd.DataFrame): Input DataFrame
+            clusters (np.array): Cluster assignments
+            features (list): Features used for clustering
+            interactive (bool): Whether to use interactive plot (overrides class setting)
+        """
+        interactive = self.interactive if interactive is None else interactive
+        n_clusters = len(np.unique(clusters))
+        
+        # Calculate cluster statistics
         cluster_stats = []
         for i in range(n_clusters):
             cluster_data = df[clusters == i]
-            stats = cluster_data[cluster_features].mean()
+            stats = cluster_data[features].mean()
             cluster_stats.append(stats)
         
-        # 创建聚类特征分析图
-        plt.figure(figsize=(15, 8))
-        cluster_stats_df = pd.DataFrame(cluster_stats, 
-                                      columns=cluster_features)
+        cluster_stats_df = pd.DataFrame(cluster_stats, columns=features)
+        cluster_stats_normalized = self.minmax_scaler.fit_transform(cluster_stats_df)
+        cluster_stats_normalized = pd.DataFrame(cluster_stats_normalized, columns=features)
         
-        # 标准化特征值以便比较
-        cluster_stats_normalized = (cluster_stats_df - cluster_stats_df.min()) / \
-                                 (cluster_stats_df.max() - cluster_stats_df.min())
+        # Calculate silhouette scores
+        try:
+            silhouette_avg = silhouette_score(df[features], clusters)
+            logger.info(f'Average silhouette score: {silhouette_avg:.3f}')
+        except Exception as e:
+            logger.warning(f'Could not calculate silhouette score: {str(e)}')
+            silhouette_avg = None
         
-        # 绘制热力图
-        sns.heatmap(cluster_stats_normalized, 
-                    annot=cluster_stats_df.round(2), 
-                    fmt='.2f',
-                    cmap='YlOrRd')
-        plt.title('聚类特征分析')
-        plt.xlabel('特征')
+        if interactive:
+            # Create subplot figure
+            fig = make_subplots(
+                rows=2, cols=2,
+                subplot_titles=(
+                    'Cluster Feature Analysis',
+                    'Cluster Size Distribution',
+                    'Feature Importance by Cluster',
+                    'Cluster Separation (2D PCA)'
+                )
+            )
+            
+            # 1. Heatmap of cluster characteristics
+            heatmap = go.Heatmap(
+                z=cluster_stats_normalized.values,
+                x=features,
+                y=[f'Cluster {i}' for i in range(n_clusters)],
+                colorscale='YlOrRd',
+                showscale=True
+            )
+            fig.add_trace(heatmap, row=1, col=1)
+            
+            # 2. Cluster size distribution
+            cluster_sizes = pd.Series(clusters).value_counts().sort_index()
+            bar = go.Bar(
+                x=[f'Cluster {i}' for i in range(n_clusters)],
+                y=cluster_sizes.values,
+                marker_color='lightblue'
+            )
+            fig.add_trace(bar, row=1, col=2)
+            
+            # 3. Feature importance by cluster
+            feature_variance = cluster_stats_df.var()
+            feature_importance = go.Bar(
+                x=features,
+                y=feature_variance.values,
+                marker_color='lightgreen'
+            )
+            fig.add_trace(feature_importance, row=2, col=1)
+            
+            # 4. PCA visualization of clusters
+            pca = PCA(n_components=2)
+            X_pca = pca.fit_transform(self.standard_scaler.fit_transform(df[features]))
+            
+            for i in range(n_clusters):
+                mask = clusters == i
+                scatter = go.Scatter(
+                    x=X_pca[mask, 0],
+                    y=X_pca[mask, 1],
+                    mode='markers',
+                    name=f'Cluster {i}',
+                    marker=dict(size=8)
+                )
+                fig.add_trace(scatter, row=2, col=2)
+            
+            # Update layout
+            fig.update_layout(
+                height=800,
+                width=1200,
+                showlegend=True,
+                title={
+                    'text': f'Cluster Analysis Overview (Silhouette Score: {silhouette_avg:.3f if silhouette_avg else "N/A"})',
+                    'y':0.95
+                },
+                template='plotly_white'
+            )
+            
+            # Save interactive plot
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            html_path = os.path.join(self.save_dir, f'cluster_analysis_{timestamp}.html')
+            fig.write_html(html_path)
+            
+            return fig
+            
+        else:
+            # Create static plots using matplotlib
+            fig = plt.figure(figsize=(20, 15))
+            
+            # 1. Heatmap of cluster characteristics
+            plt.subplot(2, 2, 1)
+            sns.heatmap(
+                cluster_stats_normalized,
+                annot=cluster_stats_df.round(2),
+                fmt='.2f',
+                cmap='YlOrRd'
+            )
+            plt.title('Cluster Feature Analysis')
+            plt.xlabel('Features')
+            plt.ylabel('Clusters')
+            
+            # 2. Cluster size distribution
+            plt.subplot(2, 2, 2)
+            cluster_sizes = pd.Series(clusters).value_counts().sort_index()
+            cluster_sizes.plot(kind='bar')
+            plt.title('Cluster Size Distribution')
+            plt.xlabel('Cluster')
+            plt.ylabel('Number of Samples')
+            
+            # 3. Feature importance by cluster
+            plt.subplot(2, 2, 3)
+            feature_variance = cluster_stats_df.var()
+            feature_variance.plot(kind='bar')
+            plt.title('Feature Importance by Cluster')
+            plt.xlabel('Features')
+            plt.ylabel('Variance')
+            plt.xticks(rotation=45)
+            
+            # 4. PCA visualization of clusters
+            plt.subplot(2, 2, 4)
+            pca = PCA(n_components=2)
+            X_pca = pca.fit_transform(self.standard_scaler.fit_transform(df[features]))
+            
+            for i in range(n_clusters):
+                mask = clusters == i
+                plt.scatter(X_pca[mask, 0], X_pca[mask, 1],
+                           label=f'Cluster {i}', alpha=0.7)
+            
+            plt.title('Cluster Separation (2D PCA)')
+            plt.xlabel('First Principal Component')
+            plt.ylabel('Second Principal Component')
+            plt.legend()
+            
+            plt.suptitle(
+                f'Cluster Analysis Overview\nSilhouette Score: {silhouette_avg:.3f if silhouette_avg else "N/A"}',
+                fontsize=16
+            )
+            
+            plt.tight_layout()
+            
+            # Save static plot
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.save_plot(f'cluster_analysis_{timestamp}')
         plt.ylabel('聚类')
         
         self.save_plot('cluster_features_analysis')

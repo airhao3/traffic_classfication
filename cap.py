@@ -1,15 +1,18 @@
 import pandas as pd
 import numpy as np
+import ipaddress
 from collections import defaultdict
 import pyshark
 from elasticsearch import Elasticsearch
 from datetime import datetime, timedelta
 import time
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
+import joblib
 import nest_asyncio
 import re
 import logging
@@ -188,116 +191,268 @@ def extract_tcp_features_from_pcap(pcap_file, time_window=60):
     return df
 
 def preprocess_tcp_features(df):
-    """预处理TCP特征"""
+    """预处理TCP特征，包含高级特征工程"""
     logger.info("开始数据预处理")
     logger.info(f"输入数据形状: {df.shape}")
 
-    # 类型转换
-    df['start_time'] = pd.to_datetime(df['start_time'])
-    df['end_time'] = pd.to_datetime(df['end_time'])
-    df['src_port'] = df['src_port'].astype(int)
-    df['dst_port'] = df['dst_port'].astype(int)
+    # 1. 基础类型转换
+    # 确保时间戳列是数值类型
+    for col in df.columns:
+        if 'time' in col.lower():
+            try:
+                # 如果是字符串类型，先转换为datetime
+                if df[col].dtype == object:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                # 如果是datetime类型，转换为UNIX时间戳
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    df[col] = df[col].astype('int64') // 10**9
+                # 如果已经是数值类型，保持不变
+                elif pd.api.types.is_numeric_dtype(df[col]):
+                    pass
+                else:
+                    # 如果无法转换，使用0填充
+                    df[col] = 0
+            except Exception as e:
+                logger.warning(f"无法转换时间列 {col}: {str(e)}")
+                df[col] = 0
     
-    # 处理时间差
-    if isinstance(df['duration'].iloc[0], pd.Timedelta):
-        df['duration'] = df['duration'].apply(lambda x: x.total_seconds())
+    # 2. 端口和IP地址处理
+    # 处理端口号
+    for col in ['src_port', 'dst_port']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # 处理缺失值
+    # 处理IP地址 - 将其转换为分类编码
+    for col in df.columns:
+        if 'ip' in col.lower() or any(x in col.lower() for x in ['src', 'dst', 'source', 'destination']):
+            if df[col].dtype == object:  # 如果是字符串类型
+                try:
+                    # 提取第一个有效的IP地址
+                    df[col] = df[col].str.extract(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})').iloc[:, 0]
+                    # 使用分类编码
+                    df[col] = pd.Categorical(df[col]).codes
+                except Exception as e:
+                    logger.warning(f"无法处理IP地址列 {col}: {str(e)}")
+                    # 如果处理失败，使用-1填充
+                    df[col] = -1
+    
+    # 3. 处理数值列中的无限值和NaN
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_columns:
+        # 替换无限值为0
+        df[col] = df[col].replace([np.inf, -np.inf], 0)
+        # 使用0填充NaN
+        df[col] = df[col].fillna(0)
+    
+    # 4. 高级流量特征工程
+    # 4.1 流量比率特征
+    if all(col in df.columns for col in ['bytes_sent', 'bytes_received', 'packets_sent', 'packets_received']):
+        df['bytes_ratio'] = df['bytes_sent'] / (df['bytes_received'] + 1)  # 加1避免除零
+        df['packets_ratio'] = df['packets_sent'] / (df['packets_received'] + 1)
+        df['bytes_per_packet_sent'] = df['bytes_sent'] / (df['packets_sent'] + 1)
+        df['bytes_per_packet_received'] = df['bytes_received'] / (df['packets_received'] + 1)
+    
+    # 4.2 TCP标志特征
+    flag_columns = ['number_of_syn_packets', 'number_of_fin_packets', 
+                   'number_of_reset_packets', 'number_of_push_packets']
+    if all(col in df.columns for col in flag_columns):
+        df['total_flags'] = df[flag_columns].sum(axis=1)
+    df['flags_per_packet'] = df['total_flags'] / (df['packets_sent'] + df['packets_received'] + 1)
+    
+    # 3.3 重传率特征
+    df['retransmission_rate'] = df['retransmission_count'] / (df['packets_sent'] + 1)
+    
+    # 3.4 会话特征
+    df['is_long_session'] = (df['duration'] > df['duration'].median()).astype(int)
+    df['is_high_volume'] = ((df['bytes_sent'] + df['bytes_received']) > 
+                           (df['bytes_sent'] + df['bytes_received']).median()).astype(int)
+    
+    # 4. 端口特征工程
+    if 'src_port' in df.columns and 'dst_port' in df.columns:
+        df['is_well_known_port_src'] = (df['src_port'] <= 1024).astype(int)
+        df['is_well_known_port_dst'] = (df['dst_port'] <= 1024).astype(int)
+    else:
+        logger.warning('缺少端口信息，设置端口特征为0')
+        df['is_well_known_port_src'] = 0
+        df['is_well_known_port_dst'] = 0
+    
+    # 5. 处理缺失值
     df = df.fillna(0)
     
+    # 6. 特征标准化
     logger.info("开始特征缩放")
     numerical_features = [
-        'duration', 'bytes_sent', 'bytes_received', 'packets_sent',
-        'packets_received', 'retransmission_count', 'avg_interarrival_time',
-        'avg_payload_length', 'number_of_syn_packets', 'number_of_fin_packets',
-        'number_of_reset_packets', 'number_of_push_packets'
+        'duration', 'bytes_sent', 'bytes_received', 'packets_sent', 'packets_received',
+        'retransmission_count', 'avg_interarrival_time', 'avg_payload_length',
+        'number_of_syn_packets', 'number_of_fin_packets', 'number_of_reset_packets',
+        'number_of_push_packets', 'bytes_ratio', 'packets_ratio', 'bytes_per_packet_sent',
+        'bytes_per_packet_received', 'flags_per_packet', 'retransmission_rate'
     ]
     
     scaler = StandardScaler()
     df[numerical_features] = scaler.fit_transform(df[numerical_features])
     
+    # 7. IP地址特征编码
     logger.info("开始分类特征编码")
-    categorical_features = ['src_ip', 'dst_ip']
     
-    # 保存原始IP地址
-    original_features = df[categorical_features].copy()
+    # 检查IP地址列是否存在
+    ip_columns = [col for col in df.columns if 'ip' in col.lower()]
+    if ip_columns:
+        # 使用LabelEncoder对每个IP地址列进行编码
+        for col in ip_columns:
+            try:
+                # 如果列不是数值类型，则进行编码
+                if not pd.api.types.is_numeric_dtype(df[col]):
+                    encoder = LabelEncoder()
+                    df[col] = encoder.fit_transform(df[col].astype(str))
+            except Exception as e:
+                logger.warning(f"无法对IP地址列 {col} 进行编码: {str(e)}")
+                df[col] = 0
+    else:
+        logger.warning("未找到IP地址相关列")
     
-    # 使用OneHotEncoder
-    encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-    encoded_cats = encoder.fit_transform(df[categorical_features])
+    # 8. 合并所有特征
+    binary_features = ['is_long_session', 'is_high_volume', 
+                      'is_well_known_port_src', 'is_well_known_port_dst']
     
-    # 获取编码后的特征名
-    encoded_feature_names = []
-    for i, feature in enumerate(categorical_features):
-        feature_names = [f"{feature}_{val}" for val in encoder.categories_[i]]
-        encoded_feature_names.extend(feature_names)
+    # 确保所有特征列存在
+    for feature in binary_features:
+        if feature not in df.columns:
+            df[feature] = 0
     
-    # 创建编码后的DataFrame
-    encoded_cats_df = pd.DataFrame(
-        encoded_cats,
-        columns=encoded_feature_names,
-        index=df.index
-    )
-    
-    # 合并数值特征和编码后的特征
-    result_df = pd.concat([
-        encoded_cats_df,
-        df.drop(columns=categorical_features)
-    ], axis=1)
+    # 只保留已经存在的特征列
+    available_features = [col for col in numerical_features + binary_features if col in df.columns]
+    result_df = df[available_features]
     
     logger.info(f"预处理完成，最终数据形状: {result_df.shape}")
     logger.info(f"特征列: {result_df.columns.tolist()}")
     
     return result_df
 
+def visualize_data_distribution(df, predictions=None, save_dir='visualizations'):
+    """对数据分布进行降维可视化
+    
+    Args:
+        df (pd.DataFrame): 输入数据框
+        predictions (array-like, optional): 模型预测结果
+        save_dir (str): 保存可视化图像的目录
+    """
+    # 初始化可视化器
+    visualizer = TrafficVisualizer(save_dir)
+    
+    # 准备数据
+    feature_cols = [col for col in df.columns if col not in 
+                    ['start_time', 'end_time', 'label', 'predicted_label']]
+    
+    if predictions is not None:
+        df = df.copy()
+        df['predicted_label'] = predictions
+        label_col = 'predicted_label'
+    else:
+        label_col = 'label' if 'label' in df.columns else None
+    
+    # 使用t-SNE进行降维可视化
+    logger.info("使用t-SNE进行数据降维可视化")
+    visualizer.plot_dimensionality_reduction(df[feature_cols],
+                                           method='tsne',
+                                           label_col=label_col,
+                                           perplexity=30)
+    
+    # 使用PCA进行降维可视化
+    logger.info("使用PCA进行数据降维可视化")
+    visualizer.plot_dimensionality_reduction(df[feature_cols],
+                                           method='pca',
+                                           label_col=label_col)
+
 def train_and_evaluate_model(df):
-    """训练和评估模型"""
+    """训练和评估模型 - 支持有标签和无标签数据"""
     logger.info("开始模型训练和评估")
     logger.info(f"输入数据形状: {df.shape}")
 
-    # 分割数据集
-    train_df = df.sample(frac=0.25, random_state=42)
-    test_df = df.drop(train_df.index)
-    logger.info(f"训练集大小: {train_df.shape}, 测试集大小: {test_df.shape}")
+    try:
+        # 确保所有列都是数值类型
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        df = df[numeric_cols]
+        
+        # 检查是否有标签列，如果没有则进行无监督学习
+        has_labels = 'label' in df.columns
+        if has_labels:
+            feature_cols = [col for col in df.columns if col != 'label']
+            X = df[feature_cols]
+            y = df['label']
+        else:
+            logger.info('未检测到标签列，将进行无监督学习')
+            X = df
+            y = None
+        
+        # 分割训练集和测试集
+        if has_labels:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+        else:
+            # 无标签情况下，简单分割数据
+            X_train, X_test = train_test_split(
+                X, test_size=0.2, random_state=42
+            )
+        
+        # 标准化数据
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # 训练模型
+        logger.info('开始训练模型...')
+        isolation_forest = IsolationForest(
+            n_estimators=100,
+            max_samples='auto',
+            contamination=0.1,
+            random_state=42
+        )
+        
+        # 训练模型
+        isolation_forest.fit(X_train_scaled)
+        
+        # 评估模型
+        y_pred = isolation_forest.predict(X_test_scaled)
+        # 转换预测结果：1为正常，-1为异常
+        y_pred_binary = np.where(y_pred == 1, 0, 1)
+        
+        if has_labels:
+            # 有标签时计算评估指标
+            accuracy = accuracy_score(y_test, y_pred_binary)
+            precision = precision_score(y_test, y_pred_binary)
+            recall = recall_score(y_test, y_pred_binary)
+            f1 = f1_score(y_test, y_pred_binary)
+            
+            logger.info(f'模型评估结果:')
+            logger.info(f'Accuracy: {accuracy:.4f}')
+            logger.info(f'Precision: {precision:.4f}')
+            logger.info(f'Recall: {recall:.4f}')
+            logger.info(f'F1-score: {f1:.4f}')
+        else:
+            # 无标签时输出异常检测结果统计
+            anomaly_ratio = np.mean(y_pred_binary)
+            logger.info(f'异常检测结果:')
+            logger.info(f'检测到的异常比例: {anomaly_ratio:.4f}')
+        
+        # 保存模型
+        model_dir = 'models'
+        os.makedirs(model_dir, exist_ok=True)
+        model_version = datetime.now().strftime('%Y%m%d_%H%M%S')
+        model_path = os.path.join(model_dir, f'model_{model_version}.joblib')
+        scaler_path = os.path.join(model_dir, f'scaler_{model_version}.joblib')
+        
+        joblib.dump(isolation_forest, model_path)
+        joblib.dump(scaler, scaler_path)
+        logger.info(f'模型已保存到: {model_path}')
+        
+        return isolation_forest, scaler
+        
+    except Exception as e:
+        logger.error(f'训练过程中出错: {str(e)}')
+        return None, None
 
-    # 定义特征列
-    feature_cols = [col for col in train_df.columns if col not in ['start_time', 'end_time']]
-    logger.info(f"使用特征数量: {len(feature_cols)}")
-
-    # 模型训练
-    isolation_forest = IsolationForest(
-        n_estimators=100,
-        max_samples=0.25,
-        contamination=0.03,
-        random_state=42,
-        n_jobs=16
-    )
-    
-    logger.info("开始训练模型")
-    isolation_forest.fit(train_df[feature_cols])
-
-    # 模型预测
-    logger.info("开始预测")
-    y_pred = isolation_forest.predict(test_df[feature_cols])
-    y_pred_binary = np.where(y_pred == -1, 1, 0)  # 1 for anomaly, 0 for normal
-
-    # 计算模型评估指标
-    accuracy = accuracy_score(np.zeros(len(y_pred_binary)), y_pred_binary)
-    precision = precision_score(np.zeros(len(y_pred_binary)), y_pred_binary, zero_division=0)
-    recall = recall_score(np.zeros(len(y_pred_binary)), y_pred_binary, zero_division=0)
-    f1 = f1_score(np.zeros(len(y_pred_binary)), y_pred_binary, zero_division=0)
-
-    # 输出评估结果
-    logger.info("\n=== 模型评估结果 ===")
-    logger.info(f"Accuracy: {accuracy:.4f}")
-    logger.info(f"Precision: {precision:.4f}")
-    logger.info(f"Recall: {recall:.4f}")
-    logger.info(f"F1-Score: {f1:.4f}")
-    
-    # 异常检测统计
-    anomaly_count = (y_pred == -1).sum()
-    logger.info(f"\n检测到的异常数量: {anomaly_count}")
-    logger.info(f"异常比例: {anomaly_count/len(y_pred):.2%}")
 
 def extract_tcp_features_from_arkime(es_host, es_index, start_time=None, end_time=None, time_window=60):
     """从Arkime的Elasticsearch中提取TCP特征"""
@@ -641,27 +796,89 @@ if __name__ == "__main__":
                 # 处理正常流量数据
                 if normal_files:
                     logger.info(f'正在处理正常流量数据，共 {len(normal_files)} 个文件')
-                    df_normal = pd.concat([extract_tcp_features_from_pcap(f) for f in normal_files])
-                    df_normal['label'] = 0  # 标记为正常流量
-                    dfs.append(df_normal)
+                    normal_dfs = []
+                    for f in normal_files:
+                        try:
+                            df = extract_tcp_features_from_pcap(f)
+                            if df is not None and not df.empty:
+                                df['label'] = 0  # 标记为正常流量
+                                normal_dfs.append(df)
+                        except Exception as e:
+                            logger.error(f'处理文件 {f} 时出错: {str(e)}')
+                    
+                    if normal_dfs:
+                        try:
+                            df_normal = pd.concat(normal_dfs, ignore_index=True)
+                            # 预处理数据
+                            df_normal = preprocess_tcp_features(df_normal)
+                            if df_normal is not None and not df_normal.empty:
+                                # 添加标签
+                                df_normal['label'] = 0  # 正常流量
+                                dfs.append(df_normal)
+                                logger.info(f'处理正常流量数据成功，形状: {df_normal.shape}')
+                        except Exception as e:
+                            logger.error(f'处理正常流量数据时出错: {str(e)}')
+                    else:
+                        logger.warning('没有成功处理任何正常流量数据')
                 else:
                     logger.warning('没有找到正常流量数据文件')
                 
                 # 处理异常流量数据
                 if abnormal_files:
                     logger.info(f'正在处理异常流量数据，共 {len(abnormal_files)} 个文件')
-                    df_abnormal = pd.concat([extract_tcp_features_from_pcap(f) for f in abnormal_files])
-                    df_abnormal['label'] = 1  # 标记为异常流量
-                    dfs.append(df_abnormal)
+                    abnormal_dfs = []
+                    for f in abnormal_files:
+                        try:
+                            df = extract_tcp_features_from_pcap(f)
+                            if df is not None and not df.empty:
+                                df['label'] = 1  # 标记为异常流量
+                                abnormal_dfs.append(df)
+                        except Exception as e:
+                            logger.error(f'处理文件 {f} 时出错: {str(e)}')
+                    
+                    if abnormal_dfs:
+                        try:
+                            df_abnormal = pd.concat(abnormal_dfs, ignore_index=True)
+                            # 预处理数据
+                            df_abnormal = preprocess_tcp_features(df_abnormal)
+                            if df_abnormal is not None and not df_abnormal.empty:
+                                # 添加标签
+                                df_abnormal['label'] = 1  # 异常流量
+                                dfs.append(df_abnormal)
+                                logger.info(f'处理异常流量数据成功，形状: {df_abnormal.shape}')
+                        except Exception as e:
+                            logger.error(f'处理异常流量数据时出错: {str(e)}')
+                    else:
+                        logger.warning('没有成功处理任何异常流量数据')
                 else:
                     logger.warning('没有找到异常流量数据文件')
                 
                 if not dfs:
                     logger.error('没有找到任何训练数据')
                     sys.exit(1)
+                elif len(dfs) == 1 and 'label' in dfs[0].columns and dfs[0]['label'].nunique() == 1:
+                    logger.warning('只发现一种类型的流量数据，将使用无监督学习方法')
                     
                 # 合并所有数据
-                df = pd.concat(dfs)
+                if dfs:
+                    df = pd.concat(dfs, ignore_index=True)
+                    
+                    # 检查并报告数据质量
+                    total_rows = len(df)
+                    nan_counts = df.isna().sum()
+                    inf_counts = df.isin([np.inf, -np.inf]).sum()
+                    
+                    if nan_counts.any() or inf_counts.any():
+                        logger.warning('数据中存在以下问题：')
+                        for col in df.columns:
+                            if nan_counts[col] > 0:
+                                logger.warning(f'列 {col} 中有 {nan_counts[col]} 个NaN值 ({nan_counts[col]/total_rows:.2%})')
+                            if inf_counts[col] > 0:
+                                logger.warning(f'列 {col} 中有 {inf_counts[col]} 个无穷值 ({inf_counts[col]/total_rows:.2%})')
+                    
+                    # 最终的数据清理
+                    df = df.replace([np.inf, -np.inf], np.nan)
+                    df = df.fillna(df.mean())
                 
                 # 预处理数据
                 df = preprocess_tcp_features(df)
